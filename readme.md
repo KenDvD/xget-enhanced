@@ -75,7 +75,7 @@
 
 点击下面的链接直接安装：
 
-👉 [安装脚本](../../raw/main/xget_accelerator.js)
+👉 [安装脚本](https://greasyfork.org/zh-CN/scripts/559674-github-xget-%E4%B8%8B%E8%BD%BD%E5%8A%A0%E9%80%9F%E5%99%A8-%E5%A2%9E%E5%BC%BA%E7%89%88)
 
 **方法二：手动安装**
 
