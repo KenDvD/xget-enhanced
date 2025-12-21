@@ -154,7 +154,6 @@
 
 <img src="screenshots/stats.png" width="400" alt="统计信息">
 
-> 💡 提示：您可以在 `screenshots/` 目录添加实际截图
 
 ---
 
