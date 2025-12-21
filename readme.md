@@ -1,4 +1,4 @@
-# ⚡ Xget 加速器增强版--github
+# ⚡ Xget 加速器增强版
 
 <div align="center">
 
