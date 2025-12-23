@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         GitHub Xget 下载加速器 - 增强优化版
 // @namespace    http://tampermonkey.net/
-// @version      3.1
+// @version      3.2
 // @description  自动加速 GitHub、GitLab、Gitea 等平台的文件下载,支持多平台和自定义加速域名，增强版功能 | UP：毕加索自画像
 // @author       Xget | Enhanced & Optimized by 毕加索自画像
 // @match        https://github.com/*
@@ -15,7 +15,9 @@
 // @match        https://civitai.com/*
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=github.com
 // @grant        GM_setValue
+// @grant        GM_setValues
 // @grant        GM_getValue
+// @grant        GM_getValues
 // @grant        GM_registerMenuCommand
 // @grant        GM_xmlhttpRequest
 // @connect      *
@@ -48,7 +50,9 @@
         // 调试模式
         debug: GM_getValue('xget_debug', false),
         // 最大重试次数
-        maxRetries: GM_getValue('xget_max_retries', 2)
+        maxRetries: GM_getValue('xget_max_retries', 2),
+        // 强力拦截模式（会调用 stopImmediatePropagation，和旧版本保持一致）
+        strongIntercept: GM_getValue('xget_strong_intercept', true)
     };
 
     // 可下载文件扩展名白名单
@@ -63,7 +67,7 @@
         'iso', 'img', 'jar', 'war'
     ];
 
-    // 平台配置映射 - 增强的匹配规则
+    // 平台配置（添加前缀和下载 URL 模式）
     const PLATFORM_CONFIG = {
         'github.com': {
             prefix: 'gh',
@@ -73,6 +77,32 @@
                 /\/archive\/.*\.(zip|tar\.gz|tar)$/,
                 /\/raw\//,
                 /\/.*\/.*\/.*\.(exe|dmg|deb|rpm|msi|pkg|apk|zip|tar\.gz|tar\.bz2|7z|rar)$/
+            ]
+        },
+        // GitHub 源码包下载（Download ZIP / tarball）
+        'codeload.github.com': {
+            prefix: 'gh',
+            name: 'GitHub',
+            patterns: [
+                /\/zip\//,
+                /\/tar\.gz\//,
+                /\/tar\//
+            ]
+        },
+        // GitHub Raw 文件下载（raw host 基本都是文件内容）
+        'raw.githubusercontent.com': {
+            prefix: 'gh',
+            name: 'GitHub',
+            patterns: [
+                /.*/
+            ]
+        },
+        // GitHub Release 资产下载（常见会跳到 objects host）
+        'objects.githubusercontent.com': {
+            prefix: 'gh',
+            name: 'GitHub',
+            patterns: [
+                /.*/
             ]
         },
         'gist.github.com': {
@@ -97,8 +127,8 @@
             name: 'Gitea',
             patterns: [
                 /\/archive\//,
-                /\/releases\/download\//,
-                /\/attachments\//
+                /\/raw\//,
+                /\/releases\/download\//
             ]
         },
         'codeberg.org': {
@@ -106,8 +136,8 @@
             name: 'Codeberg',
             patterns: [
                 /\/archive\//,
-                /\/releases\/download\//,
-                /\/attachments\//
+                /\/raw\//,
+                /\/releases\/download\//
             ]
         },
         'sourceforge.net': {
@@ -170,6 +200,29 @@
         };
     }
 
+    // 统计落盘（防止频繁写入存储）
+    const saveStatsDebounced = debounce(() => {
+        try {
+            if (typeof GM_setValues === 'function') {
+                GM_setValues({ xget_stats: CONFIG.stats });
+            } else {
+                GM_setValue('xget_stats', CONFIG.stats);
+            }
+        } catch (e) {
+            // 回退到单值写入
+            GM_setValue('xget_stats', CONFIG.stats);
+        }
+    }, 600);
+
+    // 指示器内容更新
+    function renderIndicator() {
+        const el = CONFIG._indicatorEl;
+        if (!el) return;
+        el.innerHTML = `
+            <div style="font-weight: 700; font-size: 13px;">🚀 Xget 加速已启用</div>
+        `;
+    }
+
     // 获取当前使用的加速域名
     function getAcceleratorDomain() {
         return CONFIG.customDomain || CONFIG.defaultDomain;
@@ -181,15 +234,46 @@
         return PLATFORM_CONFIG[hostname];
     }
 
-    // 检查 URL 是否在排除列表中
-    function isExcluded(url) {
-        return CONFIG.excludeList.some(pattern => {
-            try {
-                const regex = new RegExp(pattern);
-                return regex.test(url);
-            } catch {
-                return url.includes(pattern);
+    // 编译排除规则
+    function compileExcludeMatchers(list) {
+        const matchers = [];
+        for (const raw of (list || [])) {
+            const pattern = String(raw || '').trim();
+            if (!pattern) continue;
+
+            // 支持 /.../flags 形式
+            if (pattern.startsWith('/') && pattern.lastIndexOf('/') > 0) {
+                const lastSlash = pattern.lastIndexOf('/');
+                const body = pattern.slice(1, lastSlash);
+                const flags = pattern.slice(lastSlash + 1);
+                try {
+                    matchers.push({ type: 'regex', raw: pattern, re: new RegExp(body, flags) });
+                    continue;
+                } catch (e) {
+                    debugLog('排除规则正则解析失败，降级为包含匹配:', pattern, e);
+                }
             }
+
+            // 支持直接 RegExp 字符串（不带 / /）
+            try {
+                matchers.push({ type: 'regex', raw: pattern, re: new RegExp(pattern) });
+            } catch {
+                matchers.push({ type: 'substr', raw: pattern, s: pattern });
+            }
+        }
+        return matchers;
+    }
+
+    function refreshExcludeMatchers() {
+        CONFIG._excludeMatchers = compileExcludeMatchers(CONFIG.excludeList);
+    }
+
+    // 判断是否在排除列表中
+    function isExcluded(url) {
+        const matchers = CONFIG._excludeMatchers || [];
+        return matchers.some(m => {
+            if (m.type === 'regex') return m.re.test(url);
+            return url.includes(m.s);
         });
     }
 
@@ -199,7 +283,7 @@
         return DOWNLOAD_EXTENSIONS.some(ext => lowerPath.endsWith('.' + ext));
     }
 
-    // 精确匹配下载链接 - 优化版
+    // 下载链接检测 - 优化版
     function isDownloadLink(url, element) {
         try {
             const urlObj = new URL(url);
@@ -224,11 +308,12 @@
 
             // 检查文件扩展名
             const hasValidExt = hasDownloadableExtension(urlObj.pathname);
-            
+
             // 使用平台特定的正则模式匹配
             const matchesPattern = platform.patterns.some(pattern => pattern.test(urlObj.pathname));
 
-            const isDownload = hasValidExt && matchesPattern;
+            // 改为 OR：pattern 命中或扩展名命中即认为是下载（减少漏判）
+            const isDownload = matchesPattern || hasValidExt;
             debugLog('链接检测结果:', { url, hasValidExt, matchesPattern, isDownload });
 
             return isDownload;
@@ -268,32 +353,33 @@
         }
     }
 
-    // 带重试机制的 URL 转换
-    async function convertWithRetry(originalUrl, maxRetries = CONFIG.maxRetries) {
-        let lastError;
-        
-        for (let i = 0; i < maxRetries; i++) {
+    // 带重试的 URL 转换
+    async function convertWithRetry(originalUrl) {
+        const maxRetries = CONFIG.maxRetries;
+        let lastError = null;
+
+        for (let i = 0; i <= maxRetries; i++) {
             try {
                 const convertedUrl = convertToAcceleratorURL(originalUrl);
-                
+
                 // 验证转换后的URL是否有效
                 if (convertedUrl && convertedUrl !== originalUrl) {
-                    debugLog(`URL 转换成功 (尝试 ${i + 1}/${maxRetries})`);
+                    debugLog(`URL 转换成功 (尝试 ${i + 1}/${maxRetries + 1})`);
                     return convertedUrl;
                 }
-                
+
                 throw new Error('转换结果无效');
             } catch (e) {
                 lastError = e;
-                debugLog(`URL 转换重试 ${i + 1}/${maxRetries}:`, e);
-                
+                debugLog(`URL 转换重试 ${i + 1}/${maxRetries + 1}:`, e);
+
                 // 等待一小段时间再重试
-                if (i < maxRetries - 1) {
+                if (i < maxRetries) {
                     await new Promise(resolve => setTimeout(resolve, 500));
                 }
             }
         }
-        
+
         console.error('URL 转换最终失败:', lastError);
         return originalUrl;
     }
@@ -311,7 +397,7 @@
             const domain = getAcceleratorDomain();
             // 使用一个真实的小文件测试（GitHub 的 robots.txt）
             const testUrl = `https://${domain}/gh/robots.txt`;
-            
+
             debugLog('开始检测服务器可用性:', testUrl);
 
             return new Promise((resolve) => {
@@ -322,13 +408,17 @@
                 }, 3000);
 
                 GM_xmlhttpRequest({
-                    method: 'HEAD',
+                    method: 'GET',
+                    headers: {
+                        'Range': 'bytes=0-0',
+                        'Cache-Control': 'no-cache'
+                    },
                     url: testUrl,
                     timeout: 3000,
                     onload: function(response) {
                         clearTimeout(timeout);
-                        // 更严格的状态码判断
-                        const available = response.status >= 200 && response.status < 400;
+                        // 更严格的状态码判断（Range 可能返回 206）
+                        const available = (response.status >= 200 && response.status < 400) || response.status === 206;
                         debugLog('服务器响应:', { status: response.status, available });
                         updateServerStatus(available);
                         resolve(available);
@@ -354,14 +444,14 @@
         }
     }
 
-    // 更新服务器状态
+    // 更新服务器状态缓存
     function updateServerStatus(available) {
-        CONFIG.serverStatus = {
-            available: available,
-            lastCheck: Date.now()
-        };
+        CONFIG.serverStatus = { available, lastCheck: Date.now() };
         GM_setValue('xget_server_status', CONFIG.serverStatus);
         debugLog('服务器状态已更新:', CONFIG.serverStatus);
+
+        // 同步更新指示器
+        renderIndicator();
     }
 
     // 更新统计数据
@@ -372,8 +462,13 @@
         } else {
             CONFIG.stats.failed++;
         }
-        GM_setValue('xget_stats', CONFIG.stats);
+
+        // 防抖写入，减少存储 IO
+        saveStatsDebounced();
         debugLog('统计数据已更新:', CONFIG.stats);
+
+        // 同步更新指示器
+        renderIndicator();
     }
 
     // 显示通知
@@ -439,7 +534,7 @@
         }, duration);
     }
 
-    // 拦截下载链接 - 优化版
+    // 拦截下载链接 - 核心功能
     function interceptDownloadLinks() {
         const platform = getCurrentPlatform();
         if (!platform || !CONFIG.enabled) return;
@@ -448,9 +543,13 @@
 
         // 使用节流优化性能
         const handleClick = throttle(async function(e) {
+            // 仅拦截普通左键点击；避免影响 Ctrl/⌘/Shift 打开新标签等行为
+            if (e.button !== 0) return;
+            if (e.ctrlKey || e.metaKey || e.shiftKey || e.altKey) return;
+
             // 使用 closest 更高效地查找链接元素
             const target = e.target.closest('a[href]');
-            
+
             if (!target?.href) return;
 
             const href = target.href;
@@ -473,15 +572,17 @@
             // 阻止默认行为和事件传播
             e.preventDefault();
             e.stopPropagation();
-            e.stopImmediatePropagation();
+            if (CONFIG.strongIntercept) {
+                e.stopImmediatePropagation();
+            }
 
             const acceleratedUrl = await convertWithRetry(href);
 
             if (acceleratedUrl !== href) {
                 showNotification(`🚀 已启用 ${platform.name} 加速下载`, 'success', 2000);
                 updateStats(true);
-                
-                // 创建隐藏链接并触发点击，保持原文件名
+
+                // 创建隐藏链接并触发
                 const link = document.createElement('a');
                 link.href = acceleratedUrl;
                 link.download = target.download || '';
@@ -524,15 +625,12 @@
             transition: all 0.3s;
             font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
         `;
-        indicator.innerHTML = `
-            <div style="display: flex; align-items: center; gap: 8px;">
-                <span style="font-size: 16px;">⚡</span>
-                <div style="display: flex; flex-direction: column; gap: 2px;">
-                    <span style="font-weight: 600;">Xget 加速已启用</span>
-                    <span style="font-size: 10px; opacity: 0.9;">已加速: ${CONFIG.stats.success} 次</span>
-                </div>
-            </div>
-        `;
+
+        // 保存指示器引用
+        CONFIG._indicatorEl = indicator;
+
+        // 初始渲染指示器内容
+        renderIndicator();
 
         indicator.addEventListener('mouseenter', () => {
             indicator.style.transform = 'scale(1.05)';
@@ -585,6 +683,7 @@
         }
         
         debugLog('页面指示器已添加');
+
     }
 
     // 设置菜单命令 - 增强版
@@ -610,11 +709,12 @@
             }
         });
 
-        // 切换通知显示
+        // 切换通知
         GM_registerMenuCommand(CONFIG.showNotification ? '🔕 关闭通知' : '🔔 开启通知', function() {
             CONFIG.showNotification = !CONFIG.showNotification;
             GM_setValue('xget_show_notification', CONFIG.showNotification);
             showNotification(CONFIG.showNotification ? '通知已开启' : '通知已关闭', 'success');
+            location.reload();
         });
 
         // 查看统计信息
@@ -665,6 +765,7 @@
             CONFIG.autoCheck = !CONFIG.autoCheck;
             GM_setValue('xget_auto_check', CONFIG.autoCheck);
             showNotification(CONFIG.autoCheck ? '已启用服务器可用性检测' : '已禁用服务器可用性检测', 'success');
+            location.reload();
         });
 
         // 手动检测服务器
@@ -728,7 +829,7 @@
         
         console.log('%c⚡ Xget 加速器增强优化版', styles[0]);
         console.log('%c🎨 UP：毕加索自画像', styles[1]);
-        console.log('%c✨ 感谢使用本增强版脚本 | v3.1', styles[2]);
+        console.log('%c✨ 感谢使用本增强版脚本 | v3.2', styles[2]);
     }
 
     // 彩蛋：特殊组合键显示作者信息
@@ -771,7 +872,7 @@
         modal.innerHTML = `
             <div style="font-size: 48px; margin-bottom: 15px;">🎨</div>
             <div style="font-size: 24px; font-weight: 700; margin-bottom: 10px;">Xget 加速器增强优化版</div>
-            <div style="font-size: 14px; opacity: 0.9; margin-bottom: 20px;">Enhanced & Optimized Edition v3.1</div>
+            <div style="font-size: 14px; opacity: 0.9; margin-bottom: 20px;">Enhanced & Optimized Edition v3.2</div>
             <div style="border-top: 1px solid rgba(255,255,255,0.3); padding-top: 20px;">
                 <div style="font-size: 16px; margin-bottom: 8px;">✨ UP 主</div>
                 <div style="font-size: 20px; font-weight: 600; margin-bottom: 15px;">毕加索自画像</div>
